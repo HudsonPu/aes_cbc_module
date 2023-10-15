@@ -1,0 +1,9 @@
+#ignore kmd build result
+Module.symvers
+modules.order
+*.mod
+*.cmd
+*.ko
+*.o
+*.mod.c
+
