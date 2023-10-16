@@ -4,14 +4,19 @@
 #include <linux/uaccess.h>
 #include <linux/cdev.h>
 #include <linux/random.h>
+#include <linux/slab.h>
+
+#include "tiny-AES-c/aes.h"
 
 MODULE_LICENSE("GPL");
 
 #define KEY_LEN 16 // Default set to 128bit for AES128, might be extented later
+#define IV_LEN 16 // iv is 128bit for aes
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
+
 // Module parameters
 static int encrypt = 1;
 static char *key = "00112233445566778899aabbccddeeff"; // Default key
@@ -28,15 +33,19 @@ struct aes_cbc_dev{
     struct cdev cdev;
     struct class *dev_class;
     atomic_t device_in_use[2];
+    int mode;
+    unsigned char aes_key[KEY_LEN];
+    unsigned char iv[IV_LEN];
+    struct AES_ctx aesctx;
 
     char *in_buffer;
     char *out_buffer;
     size_t buf_size;
+
 };
 
 static struct aes_cbc_dev gDev;
 // AES variables
-static char aes_key[16];
 
 static int aes_cbc_module_open(struct inode *inode, struct file *file);
 static int aes_cbc_module_release(struct inode *inode, struct file *file);
@@ -52,6 +61,7 @@ static struct file_operations fops = {
 
 
 static int aes_cbc_module_open(struct inode *inode, struct file *file) {
+    int i;
     int minor = iminor(inode);      //Get the minor dev number indicate which file was opend
     // Check if the device is already open
     if(atomic_read(&gDev.device_in_use[minor])){
@@ -61,6 +71,19 @@ static int aes_cbc_module_open(struct inode *inode, struct file *file) {
     // Set the device_in_use to indicate that the device is open
     atomic_inc(&gDev.device_in_use[minor]);
     pr_info("Device %s opened successfully\n", minor ? "vencrypt_ct" : "vencrypt_pt");
+    // IV should be set to 0 only when the vencrypt_ct was opend in Decryption mode
+    // and vecnrypt_pt was opend in Encryption mode
+    if(((0 == encrypt) && (1 == minor)) ||
+       ((1 == encrypt) && (0 == minor)) )
+    {
+        memset(gDev.iv, 0, IV_LEN);
+        pr_info("Set IV to all zero when device opend!");
+        pr_info("The IV set to [");
+        for(i = 0; i < IV_LEN; i++)
+            printk(KERN_CONT "%02x",gDev.iv[i]);
+        printk(KERN_CONT "]");
+        AES_init_ctx_iv(&gDev.aesctx, gDev.aes_key, gDev.iv);
+    }
     return 0;
 }
 
@@ -108,6 +131,7 @@ static ssize_t aes_cbc_module_read(struct file *file, char __user *buf, size_t c
 static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
     // Implement the write logic here
     int ret;
+    char aes_buf[64] = {0};
     int minor = iminor(file->f_inode);      //Get the minor dev number indicate which file was opend
     pr_info("Try to write from %s\n", minor ? "vencrypt_ct" : "vencrypt_pt");
     if(((0 == encrypt) && (0 == minor)) ||
@@ -148,6 +172,10 @@ static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf, s
     // Perform AES encryption on the input data here
     pr_info("Try to Trasfer the input to output");
 
+    memcpy(aes_buf, gDev.in_buffer, gDev.buf_size > 64 ? 64 : gDev.buf_size);
+    AES_CBC_decrypt_buffer(&gDev.aesctx, aes_buf, 64);
+    memcpy(gDev.in_buffer, aes_buf, gDev.buf_size > 64 ? 64 : gDev.buf_size);
+
     gDev.out_buffer = gDev.in_buffer;
     gDev.in_buffer = NULL;
 
@@ -156,6 +184,7 @@ static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf, s
 
 static int __init aes_cbc_module_init(void) {
     // Validate encrypt parameter
+    int i;
     char tmp_key[KEY_LEN*2 +1] = {0};
     if (encrypt != 0 && encrypt != 1) {
         pr_err("Invalid value for 'encrypt' parameter. Use 0 or 1.\n");
@@ -188,7 +217,7 @@ static int __init aes_cbc_module_init(void) {
     // pr_info("Input key is [%s], length is %ld", key, strlen(key));
     if(strlen(key) < KEY_LEN*2){
         pr_warn("Input key is less than 128bit, adding 0 in the end!");
-        for(int i = 0; i < KEY_LEN*2; i ++)
+        for(i = 0; i < KEY_LEN*2; i ++)
             tmp_key[i] = '0';
         memcpy(tmp_key, key, strlen(key));
     }
@@ -198,7 +227,7 @@ static int __init aes_cbc_module_init(void) {
         memcpy(tmp_key, key,  KEY_LEN*2);
     }
     // Convert the hex key to binary
-    if (hex2bin(aes_key, tmp_key,  sizeof(aes_key)) < 0) {
+    if (hex2bin(gDev.aes_key, tmp_key,  sizeof(gDev.aes_key)) < 0) {
         pr_err("Failed to convert hex key to binary\n");
         cdev_del(&gDev.cdev);
         class_destroy(gDev.dev_class);
@@ -207,8 +236,8 @@ static int __init aes_cbc_module_init(void) {
     }
 
     pr_info("The key set to [");
-    for(int i = 0; i < KEY_LEN; i++)
-        printk(KERN_CONT "%02x",aes_key[i]);
+    for(i = 0; i < KEY_LEN; i++)
+        printk(KERN_CONT "%02x",gDev.aes_key[i]);
     printk(KERN_CONT "]");
 
     // Create AES cipher handle
