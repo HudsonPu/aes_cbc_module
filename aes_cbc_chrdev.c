@@ -11,8 +11,9 @@
 
 MODULE_LICENSE("GPL");
 
-#define KEY_LEN 16 // Default set to 128bit for AES128, might be extented later
-#define IV_LEN 16 // iv is 128bit for aes
+#define KEY_LEN 16   // Default set to 128bit for AES128, might be extented later
+#define IV_LEN 16    // iv is 128bit for aes
+#define AES_BLOCK 16 // AES handled 16 bytes as a block 
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
@@ -146,9 +147,10 @@ static ssize_t aes_cbc_module_read(struct file *file, char __user *buf, size_t c
 static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
     // Implement the write logic here
     int ret;
-    char aes_buf[64] = {0};
     char * tmp_buf;
+    char * write_buf;
     struct aesbuf *tmp_aesbuf = NULL;
+    int block_num = 0;
 
     int minor = iminor(file->f_inode);      //Get the minor dev number indicate which file was opend
     pr_info("Try to write from %s\n", minor ? "vencrypt_ct" : "vencrypt_pt");
@@ -161,38 +163,48 @@ static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf, s
         return -EACCES;
     }
 
-
     if (count > PAGE_SIZE) {
         pr_err("Input data too large\n");
         return -ENOMEM;
     }
 
-    tmp_buf = kmalloc(count, GFP_KERNEL);
-    if (!tmp_buf) {
-        pr_err("Failed to allocate memory\n");
+    write_buf = kmalloc(count, GFP_KERNEL);
+    if (!write_buf) {
+        pr_err("Failed to allocate write_buf\n");
         return -ENOMEM;
     }
 
-    ret = copy_from_user(tmp_buf, buf, count);
+    ret = copy_from_user(write_buf, buf, count);
     if (ret != 0) {
         pr_err( "Failed to copy input data from user space\n");
-        kfree(tmp_buf);
+        kfree(write_buf);
         return -EFAULT;
     }
-    
+
+    // Perform AES encryption on the input data with 16 byte memory aligned
+    pr_info("Try to do AES for the input data");
+    block_num = count/AES_BLOCK + 1;
+    tmp_buf= kmalloc(block_num * AES_BLOCK, GFP_KERNEL);
+    if (!tmp_buf) {
+        pr_err("Failed to allocate tmp_buf\n");
+        return -ENOMEM;
+    }
+    memset(tmp_buf, 0, block_num * AES_BLOCK);
+    memcpy(tmp_buf, write_buf, count);
+    kfree(write_buf);
+
     tmp_aesbuf = kmalloc(sizeof(aesbuf_st),GFP_KERNEL);
     if (!tmp_aesbuf) {
         pr_err("Failed to allocate tmp_aesbuf\n");
         return -ENOMEM;
     }
     tmp_aesbuf->k_buf = tmp_buf;
-    tmp_aesbuf->size = count;
-    
-    // Perform AES encryption on the input data here
-    pr_info("Try to do AES for the first bloc, and Trasfer the input to output");
-    memcpy(aes_buf, tmp_aesbuf->k_buf, tmp_aesbuf->size > 64 ? 64 : tmp_aesbuf->size);
-    AES_CBC_encrypt_buffer(&gDev.aesctx, aes_buf, 64);
-    memcpy(tmp_aesbuf->k_buf, aes_buf, tmp_aesbuf->size > 64 ? 64 : tmp_aesbuf->size);
+    tmp_aesbuf->size = block_num * AES_BLOCK;
+    if(1 == gDev.mode)
+        AES_CBC_encrypt_buffer(&gDev.aesctx, tmp_aesbuf->k_buf , block_num * AES_BLOCK);
+    else
+        AES_CBC_decrypt_buffer(&gDev.aesctx, tmp_aesbuf->k_buf , block_num * AES_BLOCK);
+
     spin_lock(&gDev.out_spinlock);
     list_add_tail(&(tmp_aesbuf->list), &(gDev.out_list->list));
     spin_unlock(&gDev.out_spinlock);
@@ -208,6 +220,7 @@ static int __init aes_cbc_module_init(void) {
         pr_err("Invalid value for 'encrypt' parameter. Use 0 or 1.\n");
         return -EINVAL;  // Return an error code
     }
+    gDev.mode = encrypt;
 
     // Allocate a major number dynamically
     if (alloc_chrdev_region(&gDev.dev_num, 0, 2, "acs_cbc_module") < 0) {
@@ -258,8 +271,6 @@ static int __init aes_cbc_module_init(void) {
         printk(KERN_CONT "%02x",gDev.aes_key[i]);
     printk(KERN_CONT "]");
 
-    // Create AES cipher handle
-
     // Create the device nodes
     device_create(gDev.dev_class, NULL, MKDEV(MAJOR(gDev.dev_num), 0), NULL, "vencrypt_pt");
     device_create(gDev.dev_class, NULL, MKDEV(MAJOR(gDev.dev_num), 1), NULL, "vencrypt_ct");
@@ -287,7 +298,7 @@ static int __init aes_cbc_module_init(void) {
     spin_lock_init(&gDev.in_spinlock);
     spin_lock_init(&gDev.out_spinlock);
 
-    pr_info("ACS CBC Module Loaded in %s mode!\n", (encrypt ? "Encryption" : "Decryption"));
+    pr_info("ACS CBC Module Loaded in %s mode!\n", (gDev.mode ? "Encryption" : "Decryption"));
     return 0;
 }
 
