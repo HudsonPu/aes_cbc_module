@@ -5,6 +5,7 @@
 #include <linux/cdev.h>
 #include <linux/random.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #include "tiny-AES-c/aes.h"
 
@@ -27,6 +28,12 @@ MODULE_PARM_DESC(encrypt, "1 for encryption, 0 for decryption");
 module_param(key, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(key, "AES key in hex");
 
+struct aesbuf{
+    char * k_buf;
+    size_t size;
+    struct list_head list;
+} aesbuf_st;
+
 // Character device variables
 struct aes_cbc_dev{
     dev_t dev_num;
@@ -38,9 +45,10 @@ struct aes_cbc_dev{
     unsigned char iv[IV_LEN];
     struct AES_ctx aesctx;
 
-    char *in_buffer;
-    char *out_buffer;
-    size_t buf_size;
+    struct aesbuf* in_list;
+    struct aesbuf* out_list;
+    spinlock_t in_spinlock;
+    spinlock_t out_spinlock;
 
 };
 
@@ -100,6 +108,9 @@ static ssize_t aes_cbc_module_read(struct file *file, char __user *buf, size_t c
     // Implement the read logic here
     int ret;
     ssize_t read_size = 0;
+    struct aesbuf *cur_aesbuf = NULL;
+    struct aesbuf *tmp_aesbuf = NULL;
+
     int minor = iminor(file->f_inode);      //Get the minor dev number indicate which file was opend
     pr_info("Try to read from %s\n", minor ? "vencrypt_ct" : "vencrypt_pt");
     if(((0 == encrypt) && (1 == minor)) ||
@@ -111,27 +122,34 @@ static ssize_t aes_cbc_module_read(struct file *file, char __user *buf, size_t c
         return -EACCES;
     }
 
-    if(gDev.out_buffer)
+    //Go through all the buffers need to be send out, and release them after sent to user
+    list_for_each_entry_safe(cur_aesbuf, tmp_aesbuf, &(gDev.out_list->list),list)
     {
-
-        ret = copy_to_user(buf, gDev.out_buffer, gDev.buf_size);
+        ret = copy_to_user(buf + read_size, cur_aesbuf->k_buf, cur_aesbuf->size);
         if (ret != 0) {
             pr_err( "Failed to copy output data to user space\n");
         }
-        pr_info("Read %ld data from out_buffer!", gDev.buf_size);
-        kfree(gDev.out_buffer);
-        gDev.out_buffer = NULL;
-        read_size =  gDev.buf_size;
-        gDev.buf_size = 0;
+        read_size +=  cur_aesbuf->size ;
+        pr_info("Read %ld data from current buffer list!", cur_aesbuf->size);
+        kfree(cur_aesbuf->k_buf);
+        cur_aesbuf->k_buf = NULL;
+        cur_aesbuf->size = 0;
+        spin_lock(&gDev.out_spinlock);
+        list_del(&(cur_aesbuf->list));
+        spin_unlock(&gDev.out_spinlock);
+        kfree(cur_aesbuf);
+        cur_aesbuf =  NULL;
     }
     return read_size;
-
 }
 
 static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
     // Implement the write logic here
     int ret;
     char aes_buf[64] = {0};
+    char * tmp_buf;
+    struct aesbuf *tmp_aesbuf = NULL;
+
     int minor = iminor(file->f_inode);      //Get the minor dev number indicate which file was opend
     pr_info("Try to write from %s\n", minor ? "vencrypt_ct" : "vencrypt_pt");
     if(((0 == encrypt) && (0 == minor)) ||
@@ -149,35 +167,35 @@ static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf, s
         return -ENOMEM;
     }
 
-    if(gDev.in_buffer || gDev.out_buffer)
-    {
-        pr_err("Have result not been readout, not allow to write\n");
-        return -EACCES;
-    }
-
-    gDev.in_buffer = kmalloc(count, GFP_KERNEL);
-    if (!gDev.in_buffer) {
+    tmp_buf = kmalloc(count, GFP_KERNEL);
+    if (!tmp_buf) {
         pr_err("Failed to allocate memory\n");
         return -ENOMEM;
     }
-    gDev.buf_size = count;
 
-    ret = copy_from_user(gDev.in_buffer, buf, count);
+    ret = copy_from_user(tmp_buf, buf, count);
     if (ret != 0) {
         pr_err( "Failed to copy input data from user space\n");
-        kfree(gDev.in_buffer);
+        kfree(tmp_buf);
         return -EFAULT;
     }
-
+    
+    tmp_aesbuf = kmalloc(sizeof(aesbuf_st),GFP_KERNEL);
+    if (!tmp_aesbuf) {
+        pr_err("Failed to allocate tmp_aesbuf\n");
+        return -ENOMEM;
+    }
+    tmp_aesbuf->k_buf = tmp_buf;
+    tmp_aesbuf->size = count;
+    
     // Perform AES encryption on the input data here
-    pr_info("Try to Trasfer the input to output");
-
-    memcpy(aes_buf, gDev.in_buffer, gDev.buf_size > 64 ? 64 : gDev.buf_size);
-    AES_CBC_decrypt_buffer(&gDev.aesctx, aes_buf, 64);
-    memcpy(gDev.in_buffer, aes_buf, gDev.buf_size > 64 ? 64 : gDev.buf_size);
-
-    gDev.out_buffer = gDev.in_buffer;
-    gDev.in_buffer = NULL;
+    pr_info("Try to do AES for the first bloc, and Trasfer the input to output");
+    memcpy(aes_buf, tmp_aesbuf->k_buf, tmp_aesbuf->size > 64 ? 64 : tmp_aesbuf->size);
+    AES_CBC_encrypt_buffer(&gDev.aesctx, aes_buf, 64);
+    memcpy(tmp_aesbuf->k_buf, aes_buf, tmp_aesbuf->size > 64 ? 64 : tmp_aesbuf->size);
+    spin_lock(&gDev.out_spinlock);
+    list_add_tail(&(tmp_aesbuf->list), &(gDev.out_list->list));
+    spin_unlock(&gDev.out_spinlock);
 
     return count;
 }
@@ -249,9 +267,25 @@ static int __init aes_cbc_module_init(void) {
     // Init the atomic used flag to 0
     atomic_set(&gDev.device_in_use[0], 0);
     atomic_set(&gDev.device_in_use[1], 0);
-    // No buffer been allocated when driver loaded
-    gDev.in_buffer = NULL;
-    gDev.out_buffer = NULL;
+    
+    // Init the in & out buf_list and locks
+    gDev.in_list = kmalloc(sizeof(aesbuf_st),GFP_KERNEL);
+    if(NULL == gDev.in_list)
+    {
+        pr_err("Failed to allocate gDev.in_list\n");
+        return -ENOMEM;  // Return an error code
+    }
+    INIT_LIST_HEAD(&(gDev.in_list->list));
+    gDev.out_list = kmalloc(sizeof(aesbuf_st),GFP_KERNEL);
+    if(NULL == gDev.out_list)
+    {
+        pr_err("Failed to allocate gDev.out_list\n");
+        kfree(gDev.in_list);
+        return -ENOMEM;  // Return an error code
+    }
+    INIT_LIST_HEAD(&(gDev.out_list->list));
+    spin_lock_init(&gDev.in_spinlock);
+    spin_lock_init(&gDev.out_spinlock);
 
     pr_info("ACS CBC Module Loaded in %s mode!\n", (encrypt ? "Encryption" : "Decryption"));
     return 0;
@@ -259,6 +293,8 @@ static int __init aes_cbc_module_init(void) {
 
 static void __exit aes_cbc_module_exit(void) {
     // Release resources
+    kfree(gDev.in_list);
+    kfree(gDev.out_list);
     device_destroy(gDev.dev_class, MKDEV(MAJOR(gDev.dev_num), 0));
     device_destroy(gDev.dev_class, MKDEV(MAJOR(gDev.dev_num), 1));
     class_destroy(gDev.dev_class);
