@@ -21,7 +21,7 @@ MODULE_LICENSE("GPL");
 
 // Module parameters
 static int encrypt = 1;
-static char *key = "00112233445566778899aabbccddeeff";  // Default key
+static char *key = "000102030405060708090a0b0c0d0e0f";  // Default key
 
 module_param(encrypt, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(encrypt, "1 for encryption, 0 for decryption");
@@ -48,6 +48,8 @@ struct aes_cbc_dev {
 
   struct aesbuf *in_list;
   struct aesbuf *out_list;
+
+  unsigned int read_buf_ptr;
   spinlock_t in_spinlock;
   spinlock_t out_spinlock;
 };
@@ -112,6 +114,10 @@ static ssize_t aes_cbc_module_read(struct file *file, char __user *buf,
   // Implement the read logic here
   int ret;
   ssize_t read_size = 0;
+  ssize_t read_to_userbuf_size = 0;
+  ssize_t curr_buf_left = 0;
+  char * new_buf;
+
   struct aesbuf *cur_aesbuf = NULL;
   struct aesbuf *tmp_aesbuf = NULL;
 
@@ -127,22 +133,51 @@ static ssize_t aes_cbc_module_read(struct file *file, char __user *buf,
 
   // Go through all the buffers need to be send out, and release them after sent
   // to user
-  list_for_each_entry_safe(cur_aesbuf, tmp_aesbuf, &(gDev.out_list->list),
-                           list) {
-    ret = copy_to_user(buf + read_size, cur_aesbuf->k_buf, cur_aesbuf->size);
-    if (ret != 0) {
-      pr_err("Failed to copy output data to user space\n");
+  list_for_each_entry_safe(cur_aesbuf, tmp_aesbuf, &(gDev.out_list->list),list) {
+    if(read_size + cur_aesbuf->size <= count){
+      ret = copy_to_user(buf + read_size, cur_aesbuf->k_buf, cur_aesbuf->size);
+      if (ret != 0) {
+        pr_err("Failed to copy output data to user space with err %d\n", ret);
+      }
+      read_size += cur_aesbuf->size;
+      pr_info("Read %ld data from current buffer list!", cur_aesbuf->size);
+      kfree(cur_aesbuf->k_buf);
+      cur_aesbuf->k_buf = NULL;
+      cur_aesbuf->size = 0;
+      spin_lock(&gDev.out_spinlock);
+      list_del(&(cur_aesbuf->list));
+      spin_unlock(&gDev.out_spinlock);
+      kfree(cur_aesbuf);
+      cur_aesbuf = NULL;
     }
-    read_size += cur_aesbuf->size;
-    pr_info("Read %ld data from current buffer list!", cur_aesbuf->size);
-    kfree(cur_aesbuf->k_buf);
-    cur_aesbuf->k_buf = NULL;
-    cur_aesbuf->size = 0;
-    spin_lock(&gDev.out_spinlock);
-    list_del(&(cur_aesbuf->list));
-    spin_unlock(&gDev.out_spinlock);
-    kfree(cur_aesbuf);
-    cur_aesbuf = NULL;
+    else{
+      read_to_userbuf_size = count - read_size;
+      ret = copy_to_user(buf + read_size, cur_aesbuf->k_buf, read_to_userbuf_size);
+      if (ret != 0) {
+        pr_err("Failed to copy output data to user space with err %d\n", ret);
+      }
+      read_size += read_to_userbuf_size;
+      pr_info("Read %ld data from current buffer list!", read_to_userbuf_size);
+      curr_buf_left = cur_aesbuf->size - read_to_userbuf_size;
+      pr_info("Current buffer still have %ld byte left", curr_buf_left);
+
+      // alloc a new buffer to store the data left on current buffer list
+      new_buf = kmalloc(curr_buf_left, GFP_KERNEL);
+      if (NULL == new_buf) {
+        pr_err("Failed to allocate a new buffer to store the buff left data\n");
+        return -ENOMEM;  // Return an error code
+      }
+      memcpy(new_buf, cur_aesbuf->k_buf + read_to_userbuf_size, curr_buf_left);
+      //free the priv buffer in list and replace with the byte left new_buffer
+      kfree(cur_aesbuf->k_buf);
+      cur_aesbuf->k_buf = new_buf;
+      cur_aesbuf->size = curr_buf_left;
+      pr_info("After buffer replace, read_size %ld, new buffer size %ld", read_size, cur_aesbuf->size);
+    }
+    if(read_size == count){
+      pr_info("User buffer Already full filled, break out!");
+      break;
+    }
   }
   return read_size;
 }
@@ -155,6 +190,8 @@ static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf,
   char *write_buf;
   struct aesbuf *tmp_aesbuf = NULL;
   int block_num = 0;
+  size_t saved_size = 0;
+  size_t buffer_size = 0;
 
   int minor = iminor(
       file->f_inode);  // Get the minor dev number indicate which file was opend
@@ -166,58 +203,61 @@ static ssize_t aes_cbc_module_write(struct file *file, const char __user *buf,
     return -EACCES;
   }
 
-  if (count > PAGE_SIZE) {
-    pr_err("Input data too large\n");
-    return -ENOMEM;
-  }
+  while(count > saved_size)
+  {
 
-  write_buf = kmalloc(count, GFP_KERNEL);
-  if (!write_buf) {
-    pr_err("Failed to allocate write_buf\n");
-    return -ENOMEM;
-  }
+    if(count - saved_size < PAGE_SIZE)
+      buffer_size = count - saved_size;
+    else
+      buffer_size = PAGE_SIZE;
+    write_buf = kmalloc(buffer_size, GFP_KERNEL);
+    if (!write_buf) {
+      pr_err("Failed to allocate write_buf\n");
+      return -ENOMEM;
+    }
 
-  ret = copy_from_user(write_buf, buf, count);
-  if (ret != 0) {
-    pr_err("Failed to copy input data from user space\n");
+    ret = copy_from_user(write_buf, buf + saved_size, buffer_size);
+    if (ret != 0) {
+      pr_err("Failed to copy input data from user space\n");
+      kfree(write_buf);
+      return -EFAULT;
+    }
+    saved_size += buffer_size;
+    // Perform AES encryption on the input data with 16 byte memory aligned
+    pr_info("Try to do AES for the input data");
+    if (buffer_size % AES_BLOCK)
+      block_num = buffer_size / AES_BLOCK + 1;
+    else
+      block_num = buffer_size / AES_BLOCK;
+
+    tmp_buf = kmalloc(block_num * AES_BLOCK, GFP_KERNEL);
+    if (!tmp_buf) {
+      pr_err("Failed to allocate tmp_buf\n");
+      return -ENOMEM;
+    }
+    memset(tmp_buf, 0, block_num * AES_BLOCK);
+    memcpy(tmp_buf, write_buf, buffer_size);
     kfree(write_buf);
-    return -EFAULT;
+
+    tmp_aesbuf = kmalloc(sizeof(aesbuf_st), GFP_KERNEL);
+    if (!tmp_aesbuf) {
+      pr_err("Failed to allocate tmp_aesbuf\n");
+      return -ENOMEM;
+    }
+    tmp_aesbuf->k_buf = tmp_buf;
+    tmp_aesbuf->size = block_num * AES_BLOCK;
+
+    if (1 == gDev.mode)
+      AES_CBC_encrypt_buffer(&gDev.aesctx, tmp_aesbuf->k_buf,
+                            block_num * AES_BLOCK);
+    else
+      AES_CBC_decrypt_buffer(&gDev.aesctx, tmp_aesbuf->k_buf,
+                            block_num * AES_BLOCK);
+
+    spin_lock(&gDev.out_spinlock);
+    list_add_tail(&(tmp_aesbuf->list), &(gDev.out_list->list));
+    spin_unlock(&gDev.out_spinlock);
   }
-
-  // Perform AES encryption on the input data with 16 byte memory aligned
-  pr_info("Try to do AES for the input data");
-  if (count % AES_BLOCK)
-    block_num = count / AES_BLOCK + 1;
-  else
-    block_num = count / AES_BLOCK;
-
-  tmp_buf = kmalloc(block_num * AES_BLOCK, GFP_KERNEL);
-  if (!tmp_buf) {
-    pr_err("Failed to allocate tmp_buf\n");
-    return -ENOMEM;
-  }
-  memset(tmp_buf, 0, block_num * AES_BLOCK);
-  memcpy(tmp_buf, write_buf, count);
-  kfree(write_buf);
-
-  tmp_aesbuf = kmalloc(sizeof(aesbuf_st), GFP_KERNEL);
-  if (!tmp_aesbuf) {
-    pr_err("Failed to allocate tmp_aesbuf\n");
-    return -ENOMEM;
-  }
-  tmp_aesbuf->k_buf = tmp_buf;
-  tmp_aesbuf->size = block_num * AES_BLOCK;
-  if (1 == gDev.mode)
-    AES_CBC_encrypt_buffer(&gDev.aesctx, tmp_aesbuf->k_buf,
-                           block_num * AES_BLOCK);
-  else
-    AES_CBC_decrypt_buffer(&gDev.aesctx, tmp_aesbuf->k_buf,
-                           block_num * AES_BLOCK);
-
-  spin_lock(&gDev.out_spinlock);
-  list_add_tail(&(tmp_aesbuf->list), &(gDev.out_list->list));
-  spin_unlock(&gDev.out_spinlock);
-
   return count;
 }
 
